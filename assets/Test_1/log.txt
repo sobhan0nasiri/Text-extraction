@@ -1,0 +1,79 @@
+ python main.py --mode file --file sample.jpg --detector dbnet --recognizer fast --debug
+2026-08-10 21:54:02,484 INFO __main__: Initializing models. This may take a while to download weights on the first run...
+2026-08-10 21:54:02,484 INFO strategies.corner_detection: Loading real weights for DocAligner (heatmap-regression corner detector)...
+2026-08-10 21:54:03,186 INFO strategies.corner_detection: DocAligner loaded successfully.
+2026-08-10 21:54:03,186 INFO strategies.obstacle: Loading real weights for RT-DETRv2 (PekingU/rtdetr_v2_r18vd)...
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+2026-08-10 21:54:07,399 INFO strategies.obstacle: RT-DETRv2 will run under autocast(fp16) on CUDA.
+2026-08-10 21:54:07,399 INFO strategies.obstacle: RT-DETRv2 (r18vd) loaded successfully on cuda. Obstacle classes: {'person'} -> {0} | Screen classes: {'tvmonitor', 'laptop'} -> {62, 63}
+2026-08-10 21:54:07,399 INFO strategies.text_detection: Loading real weights for docTR detector (db_resnet50)...
+2026-08-10 21:54:07,702 INFO root: Using downloaded & verified file: C:\Users\ayson\.cache\doctr\models\db_resnet50-79bd7d70.pt
+C:\Users\ayson\.conda\envs\torch_env\lib\site-packages\doctr\models\utils\pytorch.py:68: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits thefunctions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to thisexperimental feature.
+  state_dict = torch.load(archive_path, map_location="cpu")
+2026-08-10 21:54:07,757 INFO strategies.text_detection: DBNet postprocessor overrides applied: {'bin_thresh': 0.25, 'box_thresh': 0.25, 'unclip_ratio': 1.4}
+2026-08-10 21:54:07,757 INFO strategies.text_detection: docTR detector native input size was (1024, 1024). Will be dynamically scaledto max length 2056.
+2026-08-10 21:54:07,785 INFO strategies.text_detection: docTR detection weights loaded successfully on cuda [arch=db_resnet50, fp16=True].
+2026-08-10 21:54:07,786 INFO strategies.text_recognition_fast: Loading real weights for docTR fast recognizer (parseq)...
+2026-08-10 21:54:07,935 INFO root: Using downloaded & verified file: C:\Users\ayson\.cache\doctr\models\parseq-56125471.pt
+2026-08-10 21:54:08,005 INFO strategies.text_recognition_fast: docTR fast recognizer (parseq) loaded successfully on cuda [fp16=True].
+2026-08-10 21:54:08,005 INFO strategies.input_source: Loading real image file: sample.jpg
+2026-08-10 21:54:08,104 INFO pipeline: --- Preprocessing ---
+2026-08-10 21:54:08,189 INFO strategies.obstacle: Screen+Obstacle inference resolution: 1024x768 (scale=0.26)
+2026-08-10 21:54:08,570 INFO strategies.obstacle: No obstacle-class objects (person) detected.
+2026-08-10 21:54:08,572 INFO pipeline: Laptop/Monitor pre-crop bbox found: [748, 999, 4003, 2561] (score=0.63)
+2026-08-10 21:54:08,654 INFO strategies.corner_detection: Cropping to coarse bbox before corner detection: [488, 875, 4000, 2685]
+2026-08-10 21:54:08,657 INFO strategies.corner_detection: Corner-detection inference resolution: 1280x659 (scale=0.36)
+2026-08-10 21:54:08,703 INFO strategies.corner_detection: Detected corners (source=docaligner): [[1170.812255859375, 1089.4732666015625], [3837.455078125, 1137.960693359375], [3617.44580078125, 2510.2197265625], [1254.3994140625, 2435.89697265625]]
+2026-08-10 21:54:08,704 INFO strategies.corner_detection: Derived bounding box from corners: [1170, 1089, 3837, 2510]
+2026-08-10 21:54:08,707 INFO pipeline: Dynamically calculated Monitor/Paper Bounding Box: [1170, 1089, 3837, 2510]
+2026-08-10 21:54:08,829 INFO strategies.obstacle: No obstructing objects detected on the paper/monitor. Proceeding...
+2026-08-10 21:54:09,168 INFO strategies.rectification: Image rectified dynamically successfully (Resolution: 5760x2999).
+2026-08-10 21:54:09,682 INFO pipeline: --- Text Detection ---
+2026-08-10 21:54:10,100 INFO pipeline: --- Text Recognition ---
+2026-08-10 21:54:10,138 INFO strategies.text_recognition_fast: Recognizing 128 words using docTR fast recognizer...
+2026-08-10 21:54:10,593 INFO pipeline: --- Pipeline Time Summary ---
+2026-08-10 21:54:10,594 INFO pipeline: ------------------------------------------------------------
+2026-08-10 21:54:10,594 INFO pipeline: [TIME] Total model+algorithm time: 1.68s (budget: 2.50s)
+2026-08-10 21:54:10,594 INFO pipeline:   - Screen/Obstacle Detection [RT-DETRv2 (PekingU/rtdetr_v2_r18vd)]: 0.34s
+2026-08-10 21:54:10,594 INFO pipeline:   - Corner Detection          [DocAligner (heatmap-regression corner detector)]: 0.04s
+2026-08-10 21:54:10,594 INFO pipeline:   - Image Optimization        [CLAHE algorithm]: 0.31s
+2026-08-10 21:54:10,594 INFO pipeline:   - Rectification             [Perspective Warp (kornia get_perspective_transform + warp_perspective)]: 0.34s
+2026-08-10 21:54:10,594 INFO pipeline:   - Text Detection            [docTR DBNet (db_resnet50)]: 0.23s
+2026-08-10 21:54:10,594 INFO pipeline:   - Box Merging               [smart_merge_boxes algorithm]: 0.00s
+2026-08-10 21:54:10,594 INFO pipeline:   - Text Recognition          [docTR fast recognizer (parseq)]: 0.41s (128 words)
+2026-08-10 21:54:10,594 INFO pipeline: ------------------------------------------------------------
+
+[RESULT] Extracted Texts (Line by Line):
+Line 1 (10 words): Tell Git to forget about a file without deleting it:
+Line 2 (4 words): git rm --cached <file>
+Line 3 (3 words): Unstage one file:
+Line 4 (3 words): git reset <file>
+Line 5 (2 words): Unstage everything:
+Line 6 (2 words): git reset
+Line 7 (4 words): Check what you added:
+Line 8 (2 words): git status
+Line 9 (2 words): Make Commits
+Line 10 (9 words): Make a commit (and open text editor to write
+Line 11 (1 words): message):
+Line 12 (2 words): git commit
+Line 13 (3 words): Make a commit:
+Line 14 (4 words): git commit -m 'message'
+Line 15 (4 words): Commit all unstaged changes:
+Line 16 (4 words): git commit -am 'message'
+Line 17 (3 words): Diff Staged/Unstaged Changes
+Line 18 (6 words): Diff all staged and unstaged changes:
+Line 19 (3 words): git diff HEAD
+Line 20 (4 words): Diff just staged changes:
+Line 21 (3 words): git diff --staged
+Line 22 (4 words): Diff just unstaged changes:
+Line 23 (2 words): git diff
+Line 24 (2 words): Diff Commits
+Line 25 (8 words): Show diff between a commit and its parent:
+Line 26 (3 words): git show <commit>
+Line 27 (3 words): Diff two commits:
+Line 28 (4 words): git diff <commit> <commit>
+Line 29 (6 words): Diff one file since a commit:
+Line 30 (4 words): git diff <commit> <file>
+Line 31 (6 words): Show a summary of a diff:
+Line 32 (4 words): git diff <commit> --stat
+Line 33 (4 words): git show <commit> --stat

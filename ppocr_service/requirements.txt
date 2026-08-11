@@ -1,0 +1,6 @@
+flask>=3.0
+paddlepaddle-gpu
+paddlepaddle
+paddleocr
+pillow
+numpy

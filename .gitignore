@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+
+test_img/
+
+Doc/
+
+frozen_east_text_detection.pb
