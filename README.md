@@ -192,7 +192,7 @@ Replace the placeholders below with your own images/log, e.g. under assets/test1
 
 | Input | Corner Model Input | Corners Detected |
 |:---:|:---:|:---:|
-| ![Test 1 - Input](assets/Test_1/Sample.jpg) | ![Test 1 - Corner model input](assets/Test_1/debug_corner_model_input.jpg) | ![Test 1 - Corners detected](assets/Test_1/step1_corners_detected.jpg) |
+| ![Test 1 - Input](assets/Test_1/sample.jpg) | ![Test 1 - Corner model input](assets/Test_1/debug_corner_model_input.jpg) | ![Test 1 - Corners detected](assets/Test_1/step1_corners_detected.jpg) |
 
 | Flattened / Rectified | Text Boxes | Reconstructed Text |
 |:---:|:---:|:---:|
@@ -256,7 +256,7 @@ Line 33 (4 words): git show <commit> --stat
 
 | Input | Corner Model Input | Corners Detected |
 |:---:|:---:|:---:|
-| ![Test 2 - Input](assets/Test_2/Sample.jpg) | ![Test 2 - Corner model input](assets/Test_2/debug_corner_model_input.jpg) | ![Test 2 - Corners detected](assets/Test_2/step1_corners_detected.jpg) |
+| ![Test 2 - Input](assets/Test_2/sample.jpg) | ![Test 2 - Corner model input](assets/Test_2/debug_corner_model_input.jpg) | ![Test 2 - Corners detected](assets/Test_2/step1_corners_detected.jpg) |
 
 | Flattened / Rectified | Text Boxes | Reconstructed Text |
 |:---:|:---:|:---:|
