@@ -16,6 +16,7 @@ Every stage of the pipeline (obstacle detection, corner detection, rectification
   - [Pipeline architecture](#pipeline-architecture)
   - [Key features](#key-features)
   - [Supported models per stage](#supported-models-per-stage)
+  - [Parallel processing](#parallel-processing)
   - [Installation](#installation)
   - [Quick start](#quick-start)
   - [Demo / Test results](#demo--test-results)
@@ -68,6 +69,8 @@ Two independent detectors run every frame *before* any OCR happens:
 
 Only if the frame is corner-detected **and** not obstructed does it proceed to rectification and OCR — this avoids wasting compute (and producing garbage output) on frames that are unusable anyway.
 
+Independently of this per-frame gating, several stages can also be scaled *horizontally* rather than just swapped for a different backend: multi-model detector combos, in-process GPU model replicas, and the PP-OCRv5 microservice can all run several model instances concurrently on the same image (or across images) — see [Parallel processing](#parallel-processing) below.
+
 ## Key features
 
 - 🧩 **Strategy pattern everywhere** — every pipeline stage is an abstract interface (`strategies/base.py`); swapping a model is a one-line change, no pipeline surgery.
@@ -79,7 +82,9 @@ Only if the frame is corner-detected **and** not obstructed does it proceed to r
 - 🧠 **Smart word→line grouping** — column-aware, y-band clustering groups words into reading-order lines instead of naive top-to-bottom sorting.
 - 🖥️ **Live camera or static file mode**, with full step-by-step debug image export (`--debug`).
 - 🔌 **Isolated PP-OCRv5 microservice** — PaddleOCR runs in its own process/conda env over a tiny Flask API, so it never conflicts with the main PyTorch stack's dependencies.
-- ⚙️ **Everything CLI-tunable** — backbone, detector, recognizer, beam count, fp16, debug, log level, real-time budget, etc. See [`project-run.md`](project-run.md).
+- 📦 **Folder / batch mode** (`--mode folder`) — processes an entire directory of images end to end, decoding/prefetching the next file on CPU while the GPU is busy with the current one, and writes one `.txt` result per input image.
+- 🚀 **Multi-level parallel processing** — three independent, stackable levels of parallelism: across images in folder mode (`--workers`), across the text boxes of a single image via in-process GPU model replicas on separate CUDA streams (`--recognizer-replicas`), and across PP-OCRv5 microservice ports/replicas (`--ppocr-server-urls` + `PPOCR_NUM_REPLICAS`). See [Parallel processing](#parallel-processing).
+- ⚙️ **Everything CLI-tunable** — backbone, detector, recognizer, beam count, fp16, debug, log level, real-time budget, parallelism level, etc. See [`project-run.md`](project-run.md).
 
 ## Supported models per stage
 
@@ -91,6 +96,54 @@ Only if the frame is corner-detected **and** not obstructed does it proceed to r
 | Text detection | docTR DBNet · docTR 3-model ensemble · CRAFT · EAST · all combined |
 | Text recognition | TrOCR (small/base/large) · docTR fast (PARSeq/MASTER/CRNN×3/ViTSTR) · PaddleOCR PP-OCRv5 |
 
+## Parallel processing
+
+Beyond picking multi-model detector/recognizer backends, the pipeline supports **three independent, stackable levels** of parallel execution. Each lives in a different place and they can be combined freely:
+
+| Level | What runs in parallel | How to enable | Where it runs |
+|---|---|---|---|
+| 1. Across images | Decoding/prefetching the next image on CPU, overlapped with GPU inference on the current one | `--mode folder --workers N` | `main.py` (main process + CPU worker pool) |
+| 2. Within one image, across text boxes (local models) | The word boxes detected in a single image are split across N replicas of the recognition model (`trocr` / `fast`), each dispatched on its own CUDA stream | `--recognizer-replicas N` (+ `--recognizer-batch-size`) | `main.py`, same process, same GPU |
+| 3. Within one image, across PP-OCRv5 ports/replicas | Word boxes are split across multiple PP-OCRv5 microservice ports, and each port can additionally hold several internal model replicas of its own | `--ppocr-server-urls` (client side) + `PPOCR_NUM_REPLICAS` / `PPOCR_DEVICES` (server side) | One or more separate `ppocr_server.py` processes |
+
+A related but distinct form of parallelism, already mentioned under [Key features](#key-features) and [Supported models per stage](#supported-models-per-stage): the `ensemble`/`full` text-detection backends run their *underlying detector models* concurrently (also via separate CUDA streams, using the shared thread pool in `parallel_utils.py`) on the same input image and merge the results with IoU. That's "multiple different models on one input", as opposed to the "one model replicated across boxes" parallelism described in the table above.
+
+**Level 1 — across images:**
+
+```bash
+python main.py --mode folder --input-dir path/to/images --output-dir ocr_results --workers 4
+```
+
+**Level 2 — in-process GPU replicas for `trocr` / `fast`:**
+
+```bash
+python main.py --mode file --file dense_page.jpg --detector ensemble \
+    --recognizer fast --fast-arch parseq --recognizer-replicas 4 --recognizer-batch-size 16
+```
+
+Instead of a single copy of the recognition model, 4 fully independent copies are loaded; the boxes detected in the image are split roughly evenly between them and processed concurrently, each on its own CUDA stream, then merged back in the original word order.
+
+> ⚠️ **GPU memory:** each replica loads its own full copy of the model weights, so VRAM usage scales roughly linearly with `--recognizer-replicas`. 2–4 replicas per GPU is usually the sweet spot — beyond that you're mostly spending memory rather than gaining throughput, especially if a typical image only has a few dozen text boxes.
+
+**Level 3 — PP-OCRv5, two layers deep (multiple ports × replicas per port):**
+
+```bash
+# Terminal 1 — port 5005, 2 replicas on the default GPU
+PPOCR_PORT=5005 PPOCR_NUM_REPLICAS=2 python ppocr_server.py
+
+# Terminal 2 — port 5006, 2 replicas each pinned to gpu:1
+PPOCR_PORT=5006 PPOCR_NUM_REPLICAS=2 PPOCR_DEVICES=gpu:1,gpu:1 python ppocr_server.py
+
+python main.py --mode file --file dense_page.jpg --detector ensemble --recognizer ppocrv5 \
+    --ppocr-server-urls http://127.0.0.1:5005,http://127.0.0.1:5006
+```
+
+Total parallel PP-OCRv5 workers = (number of ports in `--ppocr-server-urls`) × (`PPOCR_NUM_REPLICAS` per port). The per-port replicas run as threads inside the same Flask/waitress process — since PaddleOCR inference happens outside the Python GIL, they run genuinely concurrently.
+
+All three levels can be combined at once, e.g. `--mode folder --workers 4` (across images) together with two PP-OCRv5 ports that each run two internal replicas (within each image).
+
+> For the complete argument reference, all PP-OCRv5 environment variables, and more ready-made command presets, see **[`project-run.md`](project-run.md#پردازش-موازی-parallel-processing)**.
+
 ## Installation
 
 ```bash
@@ -99,7 +152,7 @@ cd <this-repo>
 pip install -r requirements.txt
 ```
 
-> ⚠️ **Do not** install `paddlepaddle` / `paddleocr` in this environment — they conflict with `torch`/`opencv`/`huggingface-hub` here. PP-OCRv5 support runs as an isolated microservice; see [`project-run.md`](project-run.md#راه‌اندازی-میکروسرویس-pp-ocrv5) for the two-environment setup.
+> ⚠️ **Do not** install `paddlepaddle` / `paddleocr` in this environment — they conflict with `torch`/`opencv`/`huggingface-hub` here. PP-OCRv5 support runs as an isolated microservice; see [`project-run.md`](project-run.md#راه‌اندازی-میکروسرویس-pp-ocrv5) for the two-environment setup. Each `ppocr_server.py` process can additionally host multiple internal model replicas via `PPOCR_NUM_REPLICAS`/`PPOCR_DEVICES` (see [Parallel processing](#parallel-processing)) — that's controlled purely by environment variables, no extra install step needed.
 
 For `--detector east` you additionally need to download `frozen_east_text_detection.pb` manually (not distributed as a Python package) and place it next to `main.py`.
 
@@ -117,9 +170,15 @@ python main.py --mode file --file sample.jpg --detector dbnet --recognizer ppocr
 
 # Save every intermediate debug image
 python main.py --mode file --file sample.jpg --debug
+
+# Batch-process a whole folder (CPU decode/prefetch overlapped with GPU inference)
+python main.py --mode folder --input-dir path/to/images --output-dir ocr_results --workers 4
+
+# Same image, recognition split across 3 in-process GPU model replicas
+python main.py --mode file --file sample.jpg --detector ensemble --recognizer fast --recognizer-replicas 3
 ```
 
-See **[`project-run.md`](project-run.md)** for the complete argument reference and more ready-made command presets (lightweight/CPU mode, max-accuracy mode, full ensemble mode, etc.).
+See **[`project-run.md`](project-run.md)** for the complete argument reference and more ready-made command presets (lightweight/CPU mode, max-accuracy mode, full ensemble mode, etc.), and [Parallel processing](#parallel-processing) above for what `--workers`/`--recognizer-replicas`/multi-port PP-OCRv5 do and how to combine them.
 
 ## Demo / Test results
 
@@ -281,18 +340,20 @@ Demonstrates the pipeline correctly **refusing** to OCR a frame because a person
 .
 ├── main.py                        # CLI entry point, wires strategies into the pipeline
 ├── pipeline.py                    # OCRPipeline orchestration + box/line merging algorithms
+├── parallel_utils.py              # Shared thread pool, CUDA stream pool, chunk-splitting helpers (used by all parallel-processing levels)
 ├── strategies/
 │   ├── base.py                    # Abstract strategy interfaces (Strategy pattern)
 │   ├── obstacle.py                # RT-DETRv2 screen + obstacle detector
 │   ├── corner_detection.py        # DocAligner corner detector + contour fallback
 │   ├── rectification.py           # kornia-based dynamic perspective warp
 │   ├── input_source.py            # File / live camera input
-│   ├── text_detection.py          # DBNet / ensemble / CRAFT / EAST / full
+│   ├── text_detection.py          # DBNet / ensemble / CRAFT / EAST / full (stream-parallel ensembles)
 │   ├── text_recognition.py        # TrOCR
 │   ├── text_recognition_fast.py   # docTR lightweight recognizers
-│   └── text_recognition_ppocr.py  # PP-OCRv5 client (talks to the microservice)
+│   ├── text_recognition_parallel.py # Wraps N recognizer replicas across CUDA streams (--recognizer-replicas)
+│   └── text_recognition_ppocr.py  # PP-OCRv5 client (talks to one or more microservice ports)
 ├── ppocr_service/
-│   ├── ppocr_server.py            # Isolated Flask microservice for PaddleOCR
+│   ├── ppocr_server.py            # Isolated Flask microservice for PaddleOCR (supports internal replicas via PPOCR_NUM_REPLICAS)
 │   ├── ppocr.bat                  # Windows one-click launcher
 │   └── requirements.txt           # paddlepaddle / paddleocr — separate env only
 ├── requirements.txt                # Main (torch) environment
@@ -311,6 +372,7 @@ Being transparent about this: this project is **not a competitor to general-purp
 | Live-obstruction detection (person blocking view) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Multi-backend detector/recognizer swapping | ✅ (5 detectors / 3 recognizers) | ❌ | Limited | Limited | Multiple archs |
 | Confidence-based fallback re-reading | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Multi-level parallelism built into the tool itself (image / in-image replica / microservice) | ✅ (3 stackable levels, see [Parallel processing](#parallel-processing)) | External tooling only | External tooling only | Provided by external serving frameworks | External tooling only |
 | Language coverage | English-restricted by design | 100+ languages | 80+ languages | 80+ languages | Latin-focused |
 | Community size / maturity | New, single-maintainer | ~30 years, huge | Large, mature | Very large, mature | Solid, mature |
 

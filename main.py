@@ -1,9 +1,13 @@
 import argparse
+import glob
 import logging
+import multiprocessing as mp
+import os
 import ssl
 import sys
 import time
 import cv2
+import numpy as np
 import torch
 
 try:
@@ -17,6 +21,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 from pipeline import OCRPipeline
+from parallel_utils import get_shared_executor
 from strategies.corner_detection import DocAligner_RealWeightsDetector
 from strategies.obstacle import RTDETR_RealWeightsDetector
 from strategies.rectification import DynamicRectifier
@@ -30,41 +35,85 @@ from strategies.text_detection import (
 )
 
 
+def _decode_image_worker(path):
+    img_bgr = cv2.imread(path)
+    if img_bgr is None:
+        return path, None
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    return path, np.ascontiguousarray(img_rgb)
+
+
+def _write_result(out_path, results):
+    with open(out_path, "w", encoding="utf-8") as f:
+        if results:
+            for r in results:
+                f.write(r["text"] + "\n")
+        else:
+            f.write("")
+
+
+def _build_recognizer_replicas(build_one, num_replicas):
+    num_replicas = max(1, num_replicas)
+    replicas = [build_one() for _ in range(num_replicas)]
+    if len(replicas) == 1:
+        return replicas[0]
+    from strategies.text_recognition_parallel import ParallelTextRecognizer
+    return ParallelTextRecognizer(replicas)
+
+
 def build_fallback_recognizer(args):
     if args.fallback_recognizer == "none":
         return None
     elif args.fallback_recognizer == "trocr-small":
         from strategies.text_recognition import TrOCR_RealWeightsRecognizer
-        return TrOCR_RealWeightsRecognizer(
-            batch_size=16, num_beams=1,
-            model_name="microsoft/trocr-small-printed",
-            use_fp16=not args.no_fp16,
-        )
+        batch_size = args.recognizer_batch_size or 16
+
+        def _build():
+            return TrOCR_RealWeightsRecognizer(
+                batch_size=batch_size, num_beams=1,
+                model_name="microsoft/trocr-small-printed",
+                use_fp16=not args.no_fp16,
+            )
+        return _build_recognizer_replicas(_build, args.recognizer_replicas)
     elif args.fallback_recognizer == "ppocrv5":
         from strategies.text_recognition_ppocr import PPOCRv5_Recognizer
-        return PPOCRv5_Recognizer(server_url=args.ppocr_server_url)
+        return PPOCRv5_Recognizer(server_urls=args.ppocr_server_urls)
     else:
         from strategies.text_recognition_fast import DocTR_FastRecognizer
-        return DocTR_FastRecognizer(arch=args.fallback_recognizer, use_fp16=not args.no_fp16)
+        batch_size = args.recognizer_batch_size or 32
+
+        def _build():
+            return DocTR_FastRecognizer(arch=args.fallback_recognizer, use_fp16=not args.no_fp16,
+                                        batch_size=batch_size)
+        return _build_recognizer_replicas(_build, args.recognizer_replicas)
 
 
 def build_recognizer(args):
     if args.recognizer == "trocr":
         from strategies.text_recognition import TrOCR_RealWeightsRecognizer
-        primary = TrOCR_RealWeightsRecognizer(
-            batch_size=32,
-            num_beams=args.beams,
-            model_name=f"microsoft/trocr-{args.trocr_size}-printed",
-            use_fp16=not args.no_fp16,
-        )
+        batch_size = args.recognizer_batch_size or 32
+
+        def _build():
+            return TrOCR_RealWeightsRecognizer(
+                batch_size=batch_size,
+                num_beams=args.beams,
+                model_name=f"microsoft/trocr-{args.trocr_size}-printed",
+                use_fp16=not args.no_fp16,
+            )
+        primary = _build_recognizer_replicas(_build, args.recognizer_replicas)
         return primary, build_fallback_recognizer(args)
     elif args.recognizer == "fast":
         from strategies.text_recognition_fast import DocTR_FastRecognizer
-        primary = DocTR_FastRecognizer(arch=args.fast_arch, use_fp16=not args.no_fp16)
+        batch_size = args.recognizer_batch_size or 32
+
+        def _build():
+            return DocTR_FastRecognizer(arch=args.fast_arch, use_fp16=not args.no_fp16,
+                                        batch_size=batch_size)
+        primary = _build_recognizer_replicas(_build, args.recognizer_replicas)
         return primary, build_fallback_recognizer(args)
     elif args.recognizer == "ppocrv5":
         from strategies.text_recognition_ppocr import PPOCRv5_Recognizer
-        primary = PPOCRv5_Recognizer(server_url=args.ppocr_server_url)
+        primary = PPOCRv5_Recognizer(server_urls=args.ppocr_server_urls)
         return primary, build_fallback_recognizer(args)
     else:
         raise ValueError(f"Unknown recognizer '{args.recognizer}'")
@@ -88,8 +137,12 @@ def build_text_detector(args):
 
 def main():
     parser = argparse.ArgumentParser(description="OCR Pipeline")
-    parser.add_argument("--mode", type=str, choices=["camera", "file"], default="camera")
+    parser.add_argument("--mode", type=str, choices=["camera", "file", "folder"], default="camera")
     parser.add_argument("--file", type=str, help="Path to image file (required if mode='file')")
+    parser.add_argument("--input-dir", type=str, help="Directory of images to process (required if mode='folder')")
+    parser.add_argument("--output-dir", type=str, default="ocr_results", help="Where per-file .txt results are written in folder mode")
+    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 1),
+                        help="CPU worker processes used to decode/prefetch images in folder mode, overlapped with GPU inference")
 
     parser.add_argument("--obstacle-backbone", type=str, default="r18vd",
                         choices=["r18vd", "r34vd", "r50vd", "r101vd"],
@@ -106,10 +159,33 @@ def main():
     parser.add_argument("--realtime-budget", type=float, default=2.5)
     parser.add_argument("--adaptive-resolution", action="store_true",
                         help="Allow the pipeline to auto-adjust detector inference resolution based on the realtime budget. Off by default for reproducible timing/results.")
-    parser.add_argument("--ppocr-server-url", type=str, default="http://127.0.0.1:5005",
-                        help="Base URL of the isolated PP-OCRv5 microservice "
-                            "(only used when --recognizer ppocrv5). Start it with "
-                            "'python ppocr_service/ppocr_server.py' inside its own venv.")
+    parser.add_argument("--ppocr-server-urls", type=str, default="http://127.0.0.1:5005",
+                        help="Comma-separated base URLs of one or more PP-OCRv5 microservice ports "
+                            "(only used when --recognizer/--fallback-recognizer ppocrv5). For a single image, "
+                            "the detected word boxes are split evenly across these ports and sent as concurrent "
+                            "HTTP requests, e.g. 'PPOCR_PORT=5005 python ppocr_server.py' and "
+                            "'PPOCR_PORT=5006 python ppocr_server.py', then "
+                            "'--ppocr-server-urls http://127.0.0.1:5005,http://127.0.0.1:5006'. Each port can "
+                            "ALSO host several model replicas internally on its own (single-port, multi-model): "
+                            "set PPOCR_NUM_REPLICAS=N (and optionally PPOCR_DEVICES=gpu:0,gpu:1,... to spread "
+                            "replicas across GPUs, and PPOCR_REPLICA_BATCH_SIZE to cap each replica's batch) "
+                            "before starting that ppocr_server.py process. Total parallel PP-OCR workers = "
+                            "(number of ports) x (PPOCR_NUM_REPLICAS per port).")
+
+    parser.add_argument("--recognizer-replicas", type=int, default=1,
+                        help="Number of in-process model replicas to run concurrently on the GPU for the "
+                            "text-recognition stage of a SINGLE image: the detected word/line boxes are split "
+                            "evenly across these replicas and processed in parallel via CUDA streams, then "
+                            "merged back in order. Applies to --recognizer/--fallback-recognizer 'trocr', "
+                            "'trocr-small' and the docTR 'fast' architectures. Each replica loads its own full "
+                            "copy of the model weights, so GPU memory usage scales roughly linearly with this "
+                            "value. Has no effect on 'ppocrv5', whose parallelism is controlled instead by "
+                            "--ppocr-server-urls (process/port-level) and PPOCR_NUM_REPLICAS on the server side "
+                            "(in-process/thread-level).")
+    parser.add_argument("--recognizer-batch-size", type=int, default=None,
+                        help="Per-replica batch size for text recognition (default: 32 for 'trocr'/'fast', "
+                            "16 for 'trocr-small'). When --recognizer-replicas > 1, each replica processes its "
+                            "own share of boxes in batches of this size.")
 
     parser.add_argument("--fallback-recognizer", type=str, default="none",
                         choices=["none", "trocr-small", "ppocrv5", "parseq", "master", "crnn_mobilenet_v3_small", "crnn_vgg16_bn", "crnn_mobilenet_v3_large", "vitstr_small"],
@@ -128,8 +204,8 @@ def main():
 
     args = parser.parse_args()
 
-    torch.backends.cudnn.benchmark = (args.mode == "camera")
-    
+    torch.backends.cudnn.benchmark = (args.mode in ("camera", "folder"))
+
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if args.quiet:
@@ -174,6 +250,54 @@ def main():
                     print("[RESULT] No text detected.")
         except Exception:
             logger.exception("Processing failed")
+
+    elif args.mode == "folder":
+        if not args.input_dir:
+            logger.error("--input-dir argument is required when mode='folder'")
+            sys.exit(1)
+
+        exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff")
+        paths = sorted(p for e in exts for p in glob.glob(os.path.join(args.input_dir, e)))
+        if not paths:
+            logger.error(f"No images found in {args.input_dir}")
+            sys.exit(1)
+
+        os.makedirs(args.output_dir, exist_ok=True)
+        logger.info(f"Folder mode: {len(paths)} images, {args.workers} CPU decode workers overlapped with GPU inference.")
+
+        ctx = mp.get_context("spawn")
+        t_start = time.time()
+        processed = 0
+        io_executor = get_shared_executor()
+        io_futures = []
+
+        with ctx.Pool(processes=args.workers) as pool:
+            for path, img_rgb in pool.imap(_decode_image_worker, paths, chunksize=1):
+                if img_rgb is None:
+                    logger.warning(f"Skipping unreadable file: {path}")
+                    continue
+
+                image_tensor = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+
+                try:
+                    results = pipeline.process_image(image_tensor)
+                except Exception:
+                    logger.exception(f"Processing failed for {path}")
+                    continue
+
+                stem = os.path.splitext(os.path.basename(path))[0]
+                out_path = os.path.join(args.output_dir, f"{stem}.txt")
+                io_futures.append(io_executor.submit(_write_result, out_path, results))
+
+                processed += 1
+                logger.info(f"[{processed}/{len(paths)}] {path} -> {out_path}")
+
+        for fut in io_futures:
+            fut.result()
+
+        elapsed = time.time() - t_start
+        logger.info(f"Folder mode done: {processed}/{len(paths)} images in {elapsed:.1f}s "
+                    f"({processed / elapsed if elapsed > 0 else 0:.2f} img/s).")
 
     elif args.mode == "camera":
         camera_input = CameraFrameInputSource(camera_index=0)

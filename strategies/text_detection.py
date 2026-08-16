@@ -2,10 +2,12 @@ import time
 import logging
 import torch
 from contextlib import nullcontext
+from concurrent.futures import as_completed
 from doctr.models import detection_predictor
 import numpy as np
 import cv2
 from .base import TextDetectionStrategy
+from parallel_utils import get_shared_executor, get_cuda_streams
 
 import torchvision.models.vgg as _tv_vgg
 
@@ -169,12 +171,27 @@ class DocTR_MultiArchDetector(TextDetectionStrategy):
         self.model_info = f"docTR ensemble ({', '.join(archs)})"
         self.last_infer_time = 0.0
         self.last_merge_time = 0.0
-        logger.info(f"DocTR multi-arch ensemble ready with archs={archs}")
+        self._executor = get_shared_executor()
+        self._streams = get_cuda_streams(len(self.detectors))
+        logger.info(f"DocTR multi-arch ensemble ready with archs={archs} (stream-parallel dispatch, {len(self.detectors)} models)")
+
+    @staticmethod
+    def _run_on_stream(det, image, stream):
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                boxes = det.detect_text_boxes(image)
+            stream.synchronize()
+            return boxes
+        return det.detect_text_boxes(image)
 
     def detect_text_boxes(self, image: torch.Tensor) -> list:
+        futures = {
+            self._executor.submit(self._run_on_stream, det, image, self._streams[i]): det
+            for i, det in enumerate(self.detectors)
+        }
         all_boxes = []
-        for det in self.detectors:
-            all_boxes.extend(det.detect_text_boxes(image))
+        for fut in as_completed(futures):
+            all_boxes.extend(fut.result())
         self.last_infer_time = sum(det.last_infer_time for det in self.detectors)
 
         t0 = time.perf_counter()
@@ -280,14 +297,30 @@ class MultiModelTextDetector(TextDetectionStrategy):
         self.model_info = " + ".join(getattr(d, "model_info", d.__class__.__name__) for d in detectors)
         self.last_infer_time = 0.0
         self.last_merge_time = 0.0
-        logger.info(f"Full text-detection ensemble ready with {len(detectors)} models.")
+        self._executor = get_shared_executor()
+        self._streams = get_cuda_streams(len(self.detectors))
+        logger.info(f"Full text-detection ensemble ready with {len(detectors)} models (stream-parallel dispatch).")
+
+    @staticmethod
+    def _run_on_stream(det, image, stream):
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                boxes = det.detect_text_boxes(image)
+            stream.synchronize()
+            return boxes
+        return det.detect_text_boxes(image)
 
     def detect_text_boxes(self, image: torch.Tensor) -> list:
+        futures = {
+            self._executor.submit(self._run_on_stream, det, image, self._streams[i]): det
+            for i, det in enumerate(self.detectors)
+        }
         all_boxes = []
         infer_time = 0.0
-        for det in self.detectors:
+        for fut in as_completed(futures):
+            det = futures[fut]
             try:
-                all_boxes.extend(det.detect_text_boxes(image))
+                all_boxes.extend(fut.result())
                 infer_time += getattr(det, "last_infer_time", 0.0)
             except Exception as e:
                 logger.warning(f"{det.__class__.__name__} failed: {e}")

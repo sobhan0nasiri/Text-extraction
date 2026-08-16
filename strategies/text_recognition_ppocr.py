@@ -5,8 +5,10 @@ import cv2
 import numpy as np
 import requests
 import torch
+from concurrent.futures import as_completed
 
 from .base import TextRecognitionStrategy
+from parallel_utils import get_shared_executor, split_into_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -16,32 +18,44 @@ class PPOCRv5_Recognizer(TextRecognitionStrategy):
     _CLEAN_PATTERN = re.compile(r'[^A-Za-z0-9\s\.\,\:\;\!\?\-\>\<\_\(\)\[\]\'\"\/\\@#\$%&\*\+=\~\^\u2022\u2605\u25CF\u25AA\u2023\u2666]')
     _MIN_CROP_DIM = 32
 
-    def __init__(self, server_url: str = "http://127.0.0.1:5005",
-                    batch_size: int = 32, timeout: float = 15.0):
-        self.base_url = server_url.rstrip("/")
-        self.batch_url = f"{self.base_url}/recognize_batch"
+    def __init__(self, server_url=None, server_urls=None,
+                    batch_size: int = 32, timeout: float = 15.0, max_workers: int = None):
+        raw_urls = server_urls if server_urls else server_url
+        if raw_urls is None:
+            raise ValueError("PPOCRv5_Recognizer requires server_url or server_urls.")
+        if isinstance(raw_urls, str):
+            raw_urls = [u.strip() for u in raw_urls.split(",") if u.strip()]
+
         self.batch_size = batch_size
         self.timeout = timeout
         self.last_infer_time = 0.0
         self.model_info = "PP-OCRv5 (remote microservice)"
-        self._check_server()
-        logger.info(f"PP-OCRv5 recognizer connected via microservice at {self.base_url}")
+        self.base_urls = self._check_servers([u.rstrip("/") for u in raw_urls])
+        self.batch_urls = [f"{u}/recognize_batch" for u in self.base_urls]
+        self.executor = get_shared_executor()
+        logger.info(f"PP-OCRv5 recognizer connected via {len(self.base_urls)} microservice replica(s): {self.base_urls}")
 
-    def _check_server(self):
-        try:
-            resp = requests.get(f"{self.base_url}/health", timeout=5)
-            resp.raise_for_status()
-            info = resp.json()
-            model_name = info.get("model_name", "PP-OCRv5")
-            device = info.get("device", "unknown")
-            self.model_info = f"PP-OCRv5 remote microservice ({model_name}, device={device})"
-        except Exception as e:
+    def _check_servers(self, urls):
+        healthy, infos = [], []
+        for url in urls:
+            try:
+                resp = requests.get(f"{url}/health", timeout=5)
+                resp.raise_for_status()
+                info = resp.json()
+                healthy.append(url)
+                infos.append(f"{info.get('model_name', 'PP-OCRv5')}@{url} (device={info.get('device', 'unknown')})")
+            except Exception as e:
+                logger.warning(f"PP-OCRv5 replica unreachable, skipped: {url} ({e})")
+
+        if not healthy:
             raise RuntimeError(
-                f"Could not reach the PP-OCRv5 microservice at {self.base_url}. "
-                f"Start it first, in its own environment: "
-                f"'python ppocr_service/ppocr_server.py' (from inside ppocr_env). "
-                f"Details: {e}"
+                f"Could not reach any PP-OCRv5 microservice among {urls}. "
+                f"Start each replica in its own environment, e.g. "
+                f"'PPOCR_PORT=5005 python ppocr_server.py' (from inside ppocr_env)."
             )
+
+        self.model_info = f"PP-OCRv5 remote cluster ({', '.join(infos)})"
+        return healthy
 
     @staticmethod
     def _encode_crop(crop_tensor: torch.Tensor):
@@ -54,45 +68,61 @@ class PPOCRv5_Recognizer(TextRecognitionStrategy):
         ok, buf = cv2.imencode(".png", img_bgr)
         return buf.tobytes() if ok else None
 
+    def _send_batch(self, batch_url, files):
+        resp = requests.post(batch_url, files=files, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
     @torch.inference_mode()
     def recognize_text(self, image_crops: list) -> list:
         valid_crops = [c for c in image_crops
                     if c["crop_tensor"].numel() != 0
                     and c["crop_tensor"].shape[-1] != 0
                     and c["crop_tensor"].shape[-2] != 0]
-        
+
         if not valid_crops:
             return []
 
         valid_crops = sorted(valid_crops, key=lambda c: c["crop_tensor"].shape[-1] / max(1, c["crop_tensor"].shape[-2]))
-        
+
         self.last_infer_time = 0.0
+        n_replicas = len(self.batch_urls)
         logger.info(f"Recognizing {len(valid_crops)} words using PP-OCRv5 "
-                    f"(remote, batches of {self.batch_size})...")
+                    f"({n_replicas} port(s), requests of up to {self.batch_size} crops each)...")
+
+        port_groups = split_into_chunks(valid_crops, n_replicas)
+
+        futures = {}
+        for port_idx, group in enumerate(port_groups):
+            if not group:
+                continue
+            batch_url = self.batch_urls[port_idx]
+
+            for start in range(0, len(group), self.batch_size):
+                sub_batch = group[start:start + self.batch_size]
+                encoded = [self._encode_crop(c["crop_tensor"]) for c in sub_batch]
+                files = [
+                    ("images", (f"crop_{i}.png", data, "image/png"))
+                    for i, data in enumerate(encoded) if data is not None
+                ]
+                if not files:
+                    continue
+                sent_crops = [c for c, data in zip(sub_batch, encoded) if data is not None]
+                fut = self.executor.submit(self._send_batch, batch_url, files)
+                futures[fut] = sent_crops
 
         recognized_output = []
-        for start in range(0, len(valid_crops), self.batch_size):
-            batch = valid_crops[start:start + self.batch_size]
-            encoded = [self._encode_crop(c["crop_tensor"]) for c in batch]
-
-            files = [
-                ("images", (f"crop_{i}.png", data, "image/png"))
-                for i, data in enumerate(encoded) if data is not None
-            ]
-            if not files:
-                continue
-
+        for fut in as_completed(futures):
+            sent_crops = futures[fut]
             try:
-                resp = requests.post(self.batch_url, files=files, timeout=self.timeout)
-                resp.raise_for_status()
-                payload = resp.json()
-                results = payload.get("results", [])
-                self.last_infer_time += payload.get("model_time", 0.0)
+                payload = fut.result()
             except Exception as e:
-                logger.warning(f"PP-OCRv5 batch request failed ({len(batch)} crops skipped): {e}")
+                logger.warning(f"PP-OCRv5 batch request failed ({len(sent_crops)} crops skipped): {e}")
                 continue
 
-            sent_crops = [c for c, data in zip(batch, encoded) if data is not None]
+            results = payload.get("results", [])
+            self.last_infer_time = max(self.last_infer_time, payload.get("model_time", 0.0))
+
             for crop_data, res in zip(sent_crops, results):
                 text_str = self._CLEAN_PATTERN.sub('', res.get("text", "")).strip()
                 if not text_str:

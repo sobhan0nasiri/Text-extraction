@@ -202,7 +202,7 @@ class OCRPipeline:
         self.debug = debug
         self.enable_adaptive_resolution = enable_adaptive_resolution
 
-        self.is_word_level_recognizer = "FastRecognizer" in self.text_recognizer.__class__.__name__
+        self.is_word_level_recognizer = self._detect_word_level_recognizer(self.text_recognizer)
 
         self._cached_corners = None
         self._cached_coarse_bbox = None
@@ -227,6 +227,17 @@ class OCRPipeline:
     @staticmethod
     def _model_info(strategy) -> str:
         return getattr(strategy, "model_info", strategy.__class__.__name__)
+
+    @staticmethod
+    def _detect_word_level_recognizer(recognizer) -> bool:
+        if getattr(recognizer, "is_word_level", None) is not None:
+            return bool(recognizer.is_word_level)
+        if "FastRecognizer" in recognizer.__class__.__name__:
+            return True
+        for inner in getattr(recognizer, "recognizers", []):
+            if OCRPipeline._detect_word_level_recognizer(inner):
+                return True
+        return False
 
     @staticmethod
     def _bbox_iou(box_a, box_b):
