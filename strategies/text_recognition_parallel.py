@@ -4,7 +4,7 @@ from concurrent.futures import as_completed
 import torch
 
 from .base import TextRecognitionStrategy
-from parallel_utils import get_shared_executor, get_cuda_streams, split_into_chunks
+from parallel_utils import get_shared_executor, split_into_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -33,22 +33,30 @@ class ParallelTextRecognizer(TextRecognitionStrategy):
 
         self.last_infer_time = 0.0
         self._executor = get_shared_executor()
-        self._streams = get_cuda_streams(self.num_replicas)
+
+        devices = [str(getattr(r, "device", "unknown")) for r in recognizers]
+        distinct_devices = set(devices)
+        if len(distinct_devices) < self.num_replicas and "cuda" in "".join(distinct_devices):
+            logger.warning(
+                f"ParallelTextRecognizer has {self.num_replicas} replicas but only "
+                f"{len(distinct_devices)} distinct device(s) among them ({sorted(distinct_devices)}). "
+                f"Replicas sharing a GPU will NOT run with true parallelism -- consider "
+                f"--recognizer-replicas 1 with a larger --recognizer-batch-size instead."
+            )
 
         logger.info(
             f"Parallel text recognizer ready: {self.num_replicas} replica(s) of "
-            f"{first.__class__.__name__}, stream-parallel dispatch."
+            f"{first.__class__.__name__} on devices {devices} (device-parallel dispatch)."
         )
 
     @staticmethod
-    def _run_on_stream(recognizer, crops, stream):
+    def _run_on_device(recognizer, crops):
         if not crops:
             return []
-        if stream is not None:
-            with torch.cuda.stream(stream):
-                out = recognizer.recognize_text(crops)
-            stream.synchronize()
-            return out
+        device = getattr(recognizer, "device", None)
+        if device is not None and getattr(device, "type", None) == "cuda":
+            with torch.cuda.device(device):
+                return recognizer.recognize_text(crops)
         return recognizer.recognize_text(crops)
 
     def recognize_text(self, image_crops: list) -> list:
@@ -58,10 +66,10 @@ class ParallelTextRecognizer(TextRecognitionStrategy):
         chunks = split_into_chunks(image_crops, self.num_replicas)
 
         futures = {}
-        for i, (recognizer, chunk) in enumerate(zip(self.recognizers, chunks)):
+        for recognizer, chunk in zip(self.recognizers, chunks):
             if not chunk:
                 continue
-            fut = self._executor.submit(self._run_on_stream, recognizer, chunk, self._streams[i])
+            fut = self._executor.submit(self._run_on_device, recognizer, chunk)
             futures[fut] = recognizer
 
         recognized_output = []

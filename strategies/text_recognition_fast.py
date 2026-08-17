@@ -1,5 +1,4 @@
 import re
-import time
 import logging
 from contextlib import nullcontext
 import cv2
@@ -9,6 +8,7 @@ import torch
 from doctr.models import recognition_predictor
 
 from .base import TextRecognitionStrategy
+from parallel_utils import run_batches_adaptive
 
 logger = logging.getLogger(__name__)
 
@@ -18,13 +18,15 @@ class DocTR_FastRecognizer(TextRecognitionStrategy):
     _CLEAN_PATTERN = re.compile(r'[^A-Za-z0-9\s\.\,\:\;\!\?\-\>\<\_\(\)\[\]\'\"\/\\@#\$%&\*\+=\~\^\u2022\u2605\u25CF\u25AA\u2023\u2666]')
     _MIN_CROP_DIM = 4
     
-    def __init__(self, arch: str = "parseq", batch_size: int = 32, use_fp16: bool = True):
+    def __init__(self, arch: str = "parseq", batch_size: int = 32, use_fp16: bool = True, device: str = None):
         logger.info(f"Loading real weights for docTR fast recognizer ({arch})...")
 
         self.model = recognition_predictor(arch=arch, pretrained=True, symmetric_pad=False)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.type == "cuda":
-            self.model = self.model.cuda()
+            self.model = self.model.to(self.device)
+            if hasattr(self.model, "model"):
+                self.model.model = torch.compile(self.model.model)
 
         self.batch_size = batch_size
         self.use_fp16 = use_fp16 and self.device.type == "cuda"
@@ -68,31 +70,37 @@ class DocTR_FastRecognizer(TextRecognitionStrategy):
         valid_np_crops = [valid_np_crops[i] for i in order]
         crop_mapping = [crop_mapping[i] for i in order]
 
-        logger.info(f"Recognizing {len(valid_np_crops)} words using docTR fast recognizer...")
+        logger.info(f"Recognizing {len(valid_np_crops)} words using docTR fast recognizer "
+                    f"(batch={self.batch_size if self.batch_size else 'auto'})...")
 
-        recognized_output = []
-        for start in range(0, len(valid_np_crops), self.batch_size):
-            end = min(start + self.batch_size, len(valid_np_crops))
-            batch_np = valid_np_crops[start:end]
-            batch_mapping = crop_mapping[start:end]
+        def _forward(batch):
+            batch_np = [b[0] for b in batch]
+            batch_mapping = [b[1] for b in batch]
 
-            t0 = time.perf_counter()
             with self._autocast():
                 results = self.model(batch_np)
-            self.last_infer_time += time.perf_counter() - t0
 
+            batch_output = []
             for crop_data, result in zip(batch_mapping, results):
                 text_str, confidence = result
                 text_str = self._CLEAN_PATTERN.sub('', text_str).strip()
                 if not text_str:
                     continue
                 logger.debug(f" -> Word {crop_data['word_id']} {crop_data['box']}: '{text_str}'")
-                recognized_output.append({
+                batch_output.append({
                     "word_id": crop_data["word_id"],
                     "box": crop_data["box"],
                     "text": text_str,
                     "conf": float(confidence)
                 })
+            return batch_output
+
+        combined = list(zip(valid_np_crops, crop_mapping))
+        recognized_output, self.last_infer_time = run_batches_adaptive(
+            combined, _forward,
+            model_key=f"doctr_fast:{self.model_info}", device=self.device,
+            batch_size=self.batch_size, start_batch=8, max_batch=256,
+        )
 
         recognized_output.sort(key=lambda r: r["word_id"])
         return recognized_output

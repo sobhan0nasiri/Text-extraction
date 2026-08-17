@@ -50,13 +50,13 @@ def _split_indices(n_items, n_chunks):
     return chunks
 
 
-def _run_replica(model, imgs):
+def _run_replica(model, imgs, batch_size):
     if not imgs:
         return [], 0.0
     t0 = time.perf_counter()
     outputs = []
-    for start in range(0, len(imgs), REPLICA_BATCH_SIZE):
-        sub_batch = imgs[start:start + REPLICA_BATCH_SIZE]
+    for start in range(0, len(imgs), batch_size):
+        sub_batch = imgs[start:start + batch_size]
         outputs.extend(model.predict(input=sub_batch, batch_size=len(sub_batch)))
     elapsed = time.perf_counter() - t0
     return outputs, elapsed
@@ -90,6 +90,15 @@ def recognize_batch():
             print(f"[PPOCR-SERVICE][WARNING] failed to decode one crop: {e}")
             imgs.append(None)
 
+    # Optional per-request override for the model's internal batch size, sent
+    # by PPOCRv5_Recognizer as the `batch_size` form field. This is what makes
+    # the client's --recognizer-batch-size (or its auto-tuned value) actually
+    # control server-side model.predict() batching, instead of only the
+    # request-chunking size. Falls back to PPOCR_REPLICA_BATCH_SIZE when the
+    # client doesn't send a hint (e.g. other/older clients).
+    req_batch_size = request.form.get("batch_size", type=int)
+    effective_batch_size = req_batch_size if req_batch_size and req_batch_size > 0 else REPLICA_BATCH_SIZE
+
     results = [{"text": "", "conf": 0.0} for _ in imgs]
     valid_indices = [i for i, im in enumerate(imgs) if im is not None]
     valid_imgs = [imgs[i] for i in valid_indices]
@@ -103,7 +112,7 @@ def recognize_batch():
             if not idx_group:
                 continue
             replica_imgs = [valid_imgs[i] for i in idx_group]
-            fut = pool_executor.submit(_run_replica, model_pool[replica_id], replica_imgs)
+            fut = pool_executor.submit(_run_replica, model_pool[replica_id], replica_imgs, effective_batch_size)
             futures[fut] = idx_group
 
         replica_times = []

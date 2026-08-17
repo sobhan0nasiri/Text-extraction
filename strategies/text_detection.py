@@ -7,7 +7,7 @@ from doctr.models import detection_predictor
 import numpy as np
 import cv2
 from .base import TextDetectionStrategy
-from parallel_utils import get_shared_executor, get_cuda_streams
+from parallel_utils import get_shared_executor, get_cuda_streams, get_frame_rgb_uint8
 
 import torchvision.models.vgg as _tv_vgg
 
@@ -76,8 +76,7 @@ class DocTR_RealWeightsDetector(TextDetectionStrategy):
     def detect_text_boxes(self, image: torch.Tensor) -> list:
         h, w = image.shape[-2], image.shape[-1]
 
-        img_np = image.squeeze(0).permute(1, 2, 0).cpu().numpy()
-        img_np = (img_np * 255).astype(np.uint8)
+        img_np = get_frame_rgb_uint8(image)
 
         if self.detect_input_size is not None:
             scale = self.detect_input_size / max(h, w)
@@ -192,7 +191,7 @@ class DocTR_MultiArchDetector(TextDetectionStrategy):
         all_boxes = []
         for fut in as_completed(futures):
             all_boxes.extend(fut.result())
-        self.last_infer_time = sum(det.last_infer_time for det in self.detectors)
+        self.last_infer_time = max((det.last_infer_time for det in self.detectors), default=0.0)
 
         t0 = time.perf_counter()
         merged = merge_multi_detector_boxes(all_boxes, iou_threshold=0.35)
@@ -213,7 +212,7 @@ class CRAFT_TextDetector(TextDetectionStrategy):
         logger.info(f"CRAFT text detector loaded on {self.device}.")
 
     def detect_text_boxes(self, image: torch.Tensor) -> list:
-        img_np = (image.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        img_np = get_frame_rgb_uint8(image)
 
         t0 = time.perf_counter()
         prediction = self.craft.detect_text(img_np)
@@ -241,7 +240,7 @@ class EAST_TextDetector(TextDetectionStrategy):
         logger.info(f"EAST detector loaded from {model_path}.")
 
     def detect_text_boxes(self, image: torch.Tensor) -> list:
-        img_np = (image.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        img_np = get_frame_rgb_uint8(image)
         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
         orig_h, orig_w = img_bgr.shape[:2]
         rW, rH = orig_w / float(self.input_w), orig_h / float(self.input_h)
@@ -321,7 +320,7 @@ class MultiModelTextDetector(TextDetectionStrategy):
             det = futures[fut]
             try:
                 all_boxes.extend(fut.result())
-                infer_time += getattr(det, "last_infer_time", 0.0)
+                infer_time = max(infer_time, getattr(det, "last_infer_time", 0.0))
             except Exception as e:
                 logger.warning(f"{det.__class__.__name__} failed: {e}")
         self.last_infer_time = infer_time

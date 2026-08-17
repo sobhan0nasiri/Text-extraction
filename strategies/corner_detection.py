@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from docaligner import DocAligner
 from .base import CornerDetectionStrategy
+from parallel_utils import get_frame_rgb_uint8
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +23,7 @@ class DocAligner_RealWeightsDetector(CornerDetectionStrategy):
 
     @torch.inference_mode()
     def detect_corners(self, image: torch.Tensor, coarse_bbox=None) -> tuple:
-        image_3d = image.squeeze(0)
-        img_np_full = image_3d.permute(1, 2, 0).cpu().numpy()
-        img_np_full = (img_np_full * 255).astype(np.uint8)
+        img_np_full = get_frame_rgb_uint8(image)
         img_bgr_full = cv2.cvtColor(img_np_full, cv2.COLOR_RGB2BGR)
 
         h, w = img_bgr_full.shape[:2]

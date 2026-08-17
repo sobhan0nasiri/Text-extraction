@@ -1,5 +1,4 @@
 import re
-import time
 import logging
 from contextlib import nullcontext
 
@@ -10,6 +9,7 @@ from PIL import Image, ImageOps
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel, LogitsProcessor, LogitsProcessorList
 
 from .base import TextRecognitionStrategy
+from parallel_utils import run_batches_pipelined
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +64,10 @@ class TrOCR_RealWeightsRecognizer(TextRecognitionStrategy):
     def __init__(self, batch_size: int = 32, num_beams: int = 1,
                     model_name: str = "microsoft/trocr-base-printed",
                     use_fp16: bool = True, normalize_polarity: bool = True,
-                    upscale_small_crops: bool = True):
+                    upscale_small_crops: bool = True, device: str = None):
         logger.info(f"Loading real weights for TrOCR ({model_name})...")
         self.processor = TrOCRProcessor.from_pretrained(model_name)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.batch_size = batch_size
         self.num_beams = num_beams
         self.normalize_polarity = normalize_polarity
@@ -77,6 +77,8 @@ class TrOCR_RealWeightsRecognizer(TextRecognitionStrategy):
         _remove_unused_pooler(self.model)
         self.model.to(self.device)
         self.model.eval()
+        if self.device.type == "cuda":
+            self.model = torch.compile(self.model)
 
         self.use_fp16 = use_fp16 and self.device.type == "cuda"
         self.model_info = f"TrOCR ({model_name}, beams={num_beams})"
@@ -155,22 +157,25 @@ class TrOCR_RealWeightsRecognizer(TextRecognitionStrategy):
         valid_crops.sort(key=lambda c: (c["box"][2] - c["box"][0]))
 
         total = len(valid_crops)
-        recognized_output = []
-        logger.info(f"Recognizing {total} words in batches of {self.batch_size} "
+        logger.info(f"Recognizing {total} words in batches of "
+                    f"{self.batch_size if self.batch_size else 'auto'} "
                     f"(English-restricted, beams={self.num_beams})...")
 
-        for start in range(0, total, self.batch_size):
-            end = min(start + self.batch_size, total)
-            batch_crops = valid_crops[start:end]
+        def _prepare(batch_crops):
             batch_images = [self._prepare_pil(c["crop_tensor"]) for c in batch_crops]
             batch_widths = [c["box"][2] - c["box"][0] for c in batch_crops]
 
             pixel_values = self.processor(images=batch_images, return_tensors="pt").pixel_values
-            pixel_values = pixel_values.to(self.device)
+            if self.device.type == "cuda":
+                pixel_values = pixel_values.pin_memory()
 
             max_new_tokens = self._dynamic_max_new_tokens(batch_widths)
+            return pixel_values, max_new_tokens
 
-            t0 = time.perf_counter()
+        def _compute(batch_crops, prepared):
+            pixel_values, max_new_tokens = prepared
+            pixel_values = pixel_values.to(self.device, non_blocking=True)
+
             with self._autocast():
                 generated_ids = self.model.generate(
                     pixel_values,
@@ -180,20 +185,27 @@ class TrOCR_RealWeightsRecognizer(TextRecognitionStrategy):
                     eos_token_id=self.eos_token_id,
                     pad_token_id=self.pad_token_id,
                 )
-            self.last_infer_time += time.perf_counter() - t0
 
             texts = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
 
+            batch_output = []
             for crop_data, text_str in zip(batch_crops, texts):
                 text_str = self._CLEAN_PATTERN.sub('', text_str).strip()
                 if not text_str:
                     continue
                 logger.debug(f" -> Word {crop_data['word_id']} {crop_data['box']}: '{text_str}'")
-                recognized_output.append({
+                batch_output.append({
                     "word_id": crop_data["word_id"],
                     "box": crop_data["box"],
                     "text": text_str
                 })
+            return batch_output
+
+        recognized_output, self.last_infer_time = run_batches_pipelined(
+            valid_crops, _prepare, _compute,
+            model_key=f"trocr:{self.model_info}", device=self.device,
+            batch_size=self.batch_size, start_batch=4, max_batch=256,
+        )
 
         recognized_output.sort(key=lambda r: r["word_id"])
         return recognized_output

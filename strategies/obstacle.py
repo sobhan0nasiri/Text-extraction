@@ -6,6 +6,7 @@ import cv2
 from contextlib import nullcontext
 from transformers import AutoImageProcessor, AutoModelForObjectDetection
 from .base import ObstacleDetectionStrategy, FrameDetections, DetectedObject
+from parallel_utils import get_frame_rgb_uint8
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ class RTDETR_RealWeightsDetector(ObstacleDetectionStrategy):
 
     @torch.inference_mode()
     def analyze(self, image: torch.Tensor) -> FrameDetections:
-        img_np_full = (image.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        img_np_full = get_frame_rgb_uint8(image)
         orig_h, orig_w = img_np_full.shape[:2]
 
         scale = min(1.0, self.max_inference_dim / max(orig_h, orig_w))

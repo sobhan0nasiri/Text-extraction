@@ -21,7 +21,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 from pipeline import OCRPipeline
-from parallel_utils import get_shared_executor
+from parallel_utils import get_shared_executor, get_replica_devices
 from strategies.corner_detection import DocAligner_RealWeightsDetector
 from strategies.obstacle import RTDETR_RealWeightsDetector
 from strategies.rectification import DynamicRectifier
@@ -52,9 +52,22 @@ def _write_result(out_path, results):
             f.write("")
 
 
-def _build_recognizer_replicas(build_one, num_replicas):
+def _parse_devices(spec: str):
+    if not spec:
+        return None
+    return [d.strip() for d in spec.split(",") if d.strip()]
+
+
+def _resolve_batch_size(args, default):
+    if args.auto_batch_size:
+        return None
+    return args.recognizer_batch_size or default
+
+
+def _build_recognizer_replicas(build_one, num_replicas, explicit_devices=None):
     num_replicas = max(1, num_replicas)
-    replicas = [build_one() for _ in range(num_replicas)]
+    devices = get_replica_devices(num_replicas, explicit_devices=explicit_devices)
+    replicas = [build_one(device) for device in devices]
     if len(replicas) == 1:
         return replicas[0]
     from strategies.text_recognition_parallel import ParallelTextRecognizer
@@ -66,54 +79,62 @@ def build_fallback_recognizer(args):
         return None
     elif args.fallback_recognizer == "trocr-small":
         from strategies.text_recognition import TrOCR_RealWeightsRecognizer
-        batch_size = args.recognizer_batch_size or 16
+        batch_size = _resolve_batch_size(args, 16)
 
-        def _build():
+        def _build(device):
             return TrOCR_RealWeightsRecognizer(
                 batch_size=batch_size, num_beams=1,
                 model_name="microsoft/trocr-small-printed",
                 use_fp16=not args.no_fp16,
+                device=device,
             )
-        return _build_recognizer_replicas(_build, args.recognizer_replicas)
+        return _build_recognizer_replicas(_build, args.recognizer_replicas,
+                                            explicit_devices=_parse_devices(args.recognizer_devices))
     elif args.fallback_recognizer == "ppocrv5":
         from strategies.text_recognition_ppocr import PPOCRv5_Recognizer
-        return PPOCRv5_Recognizer(server_urls=args.ppocr_server_urls)
+        batch_size = _resolve_batch_size(args, 32)
+        return PPOCRv5_Recognizer(server_urls=args.ppocr_server_urls, batch_size=batch_size)
     else:
         from strategies.text_recognition_fast import DocTR_FastRecognizer
-        batch_size = args.recognizer_batch_size or 32
+        batch_size = _resolve_batch_size(args, 32)
 
-        def _build():
+        def _build(device):
             return DocTR_FastRecognizer(arch=args.fallback_recognizer, use_fp16=not args.no_fp16,
-                                        batch_size=batch_size)
-        return _build_recognizer_replicas(_build, args.recognizer_replicas)
+                                        batch_size=batch_size, device=device)
+        return _build_recognizer_replicas(_build, args.recognizer_replicas,
+                                            explicit_devices=_parse_devices(args.recognizer_devices))
 
 
 def build_recognizer(args):
     if args.recognizer == "trocr":
         from strategies.text_recognition import TrOCR_RealWeightsRecognizer
-        batch_size = args.recognizer_batch_size or 32
+        batch_size = _resolve_batch_size(args, 32)
 
-        def _build():
+        def _build(device):
             return TrOCR_RealWeightsRecognizer(
                 batch_size=batch_size,
                 num_beams=args.beams,
                 model_name=f"microsoft/trocr-{args.trocr_size}-printed",
                 use_fp16=not args.no_fp16,
+                device=device,
             )
-        primary = _build_recognizer_replicas(_build, args.recognizer_replicas)
+        primary = _build_recognizer_replicas(_build, args.recognizer_replicas,
+                                                explicit_devices=_parse_devices(args.recognizer_devices))
         return primary, build_fallback_recognizer(args)
     elif args.recognizer == "fast":
         from strategies.text_recognition_fast import DocTR_FastRecognizer
-        batch_size = args.recognizer_batch_size or 32
+        batch_size = _resolve_batch_size(args, 32)
 
-        def _build():
+        def _build(device):
             return DocTR_FastRecognizer(arch=args.fast_arch, use_fp16=not args.no_fp16,
-                                        batch_size=batch_size)
-        primary = _build_recognizer_replicas(_build, args.recognizer_replicas)
+                                        batch_size=batch_size, device=device)
+        primary = _build_recognizer_replicas(_build, args.recognizer_replicas,
+                                                explicit_devices=_parse_devices(args.recognizer_devices))
         return primary, build_fallback_recognizer(args)
     elif args.recognizer == "ppocrv5":
         from strategies.text_recognition_ppocr import PPOCRv5_Recognizer
-        primary = PPOCRv5_Recognizer(server_urls=args.ppocr_server_urls)
+        batch_size = _resolve_batch_size(args, 32)
+        primary = PPOCRv5_Recognizer(server_urls=args.ppocr_server_urls, batch_size=batch_size)
         return primary, build_fallback_recognizer(args)
     else:
         raise ValueError(f"Unknown recognizer '{args.recognizer}'")
@@ -161,31 +182,55 @@ def main():
                         help="Allow the pipeline to auto-adjust detector inference resolution based on the realtime budget. Off by default for reproducible timing/results.")
     parser.add_argument("--ppocr-server-urls", type=str, default="http://127.0.0.1:5005",
                         help="Comma-separated base URLs of one or more PP-OCRv5 microservice ports "
-                            "(only used when --recognizer/--fallback-recognizer ppocrv5). For a single image, "
-                            "the detected word boxes are split evenly across these ports and sent as concurrent "
-                            "HTTP requests, e.g. 'PPOCR_PORT=5005 python ppocr_server.py' and "
-                            "'PPOCR_PORT=5006 python ppocr_server.py', then "
-                            "'--ppocr-server-urls http://127.0.0.1:5005,http://127.0.0.1:5006'. Each port can "
-                            "ALSO host several model replicas internally on its own (single-port, multi-model): "
-                            "set PPOCR_NUM_REPLICAS=N (and optionally PPOCR_DEVICES=gpu:0,gpu:1,... to spread "
-                            "replicas across GPUs, and PPOCR_REPLICA_BATCH_SIZE to cap each replica's batch) "
-                            "before starting that ppocr_server.py process. Total parallel PP-OCR workers = "
-                            "(number of ports) x (PPOCR_NUM_REPLICAS per port).")
+                            "(only used when --recognizer/--fallback-recognizer ppocrv5). The detected word "
+                            "boxes are split evenly across these ports. Within a port, the client queries "
+                            "/health for that server's real GPU-worker count (PPOCR_NUM_REPLICAS) and sends "
+                            "AT MOST THAT MANY concurrent HTTP requests -- e.g. a single-GPU server with the "
+                            "default PPOCR_NUM_REPLICAS=1 gets ONE request carrying all of its share of the "
+                            "crops, letting the server batch through them internally instead of the client "
+                            "fragmenting into many small requests that would just queue up behind one GPU "
+                            "worker anyway. For real multi-GPU parallelism, run multiple ports, e.g. "
+                            "'PPOCR_PORT=5005 python ppocr_server.py' and 'PPOCR_PORT=5006 python "
+                            "ppocr_server.py', then '--ppocr-server-urls http://127.0.0.1:5005,"
+                            "http://127.0.0.1:5006'. Each port can ALSO host several model replicas "
+                            "internally on its own: set PPOCR_NUM_REPLICAS=N (and optionally "
+                            "PPOCR_DEVICES=gpu:0,gpu:1,... to spread replicas across GPUs) before starting "
+                            "that ppocr_server.py process.")
 
     parser.add_argument("--recognizer-replicas", type=int, default=1,
-                        help="Number of in-process model replicas to run concurrently on the GPU for the "
-                            "text-recognition stage of a SINGLE image: the detected word/line boxes are split "
-                            "evenly across these replicas and processed in parallel via CUDA streams, then "
-                            "merged back in order. Applies to --recognizer/--fallback-recognizer 'trocr', "
-                            "'trocr-small' and the docTR 'fast' architectures. Each replica loads its own full "
-                            "copy of the model weights, so GPU memory usage scales roughly linearly with this "
-                            "value. Has no effect on 'ppocrv5', whose parallelism is controlled instead by "
-                            "--ppocr-server-urls (process/port-level) and PPOCR_NUM_REPLICAS on the server side "
-                            "(in-process/thread-level).")
+                        help="Number of in-process model replicas to run concurrently for the text-recognition "
+                            "stage of a SINGLE image: the detected word/line boxes are split evenly across these "
+                            "replicas, each processed on its own device, then merged back in order. Applies to "
+                            "--recognizer/--fallback-recognizer 'trocr', 'trocr-small' and the docTR 'fast' "
+                            "architectures. Each replica loads its own full copy of the model weights, so GPU "
+                            "memory usage scales roughly linearly with this value. Replicas are auto-placed one "
+                            "per physical GPU when 2+ GPUs are visible (true parallelism); if fewer GPUs than "
+                            "replicas are visible (e.g. a single-GPU machine), a warning is logged and replicas "
+                            "share a GPU, which will NOT be faster -- prefer leaving this at 1 and raising "
+                            "--recognizer-batch-size instead on a single GPU. Has no effect on 'ppocrv5', whose "
+                            "parallelism is controlled instead by --ppocr-server-urls (process/port-level) and "
+                            "PPOCR_NUM_REPLICAS on the server side (in-process/thread-level).")
+    parser.add_argument("--recognizer-devices", type=str, default=None,
+                        help="Optional comma-separated device override for recognizer replicas, e.g. "
+                            "'cuda:0,cuda:1'. Only relevant when --recognizer-replicas > 1. If omitted, devices "
+                            "are auto-detected (see --recognizer-replicas).")
     parser.add_argument("--recognizer-batch-size", type=int, default=None,
                         help="Per-replica batch size for text recognition (default: 32 for 'trocr'/'fast', "
                             "16 for 'trocr-small'). When --recognizer-replicas > 1, each replica processes its "
-                            "own share of boxes in batches of this size.")
+                            "own share of boxes in batches of this size. For 'ppocrv5' this controls ONLY the "
+                            "server's internal model.predict() chunk size (sent as a request field, overriding "
+                            "PPOCR_REPLICA_BATCH_SIZE for the call) -- it does NOT change how many HTTP "
+                            "requests are sent (that's decided by each server's real GPU-worker count; see "
+                            "--ppocr-server-urls). On a single GPU, raise this (e.g. 64-128) to get real "
+                            "batched-forward-pass speedup; more concurrent requests would not help. Ignored "
+                            "if --auto-batch-size is also given.")
+    parser.add_argument("--auto-batch-size", action="store_true",
+                        help="Ignore --recognizer-batch-size and let the recognizer self-tune its batch size "
+                            "at runtime instead: starts small, grows while it keeps improving items/sec "
+                            "throughput, and halves + backs off immediately on a CUDA OOM (local recognizers) "
+                            "or a failed/timed-out request (ppocrv5). State is shared across replicas and "
+                            "across images in --mode folder, so it keeps improving over a run. Recommended "
+                            "when you're not sure what batch size is safe for your GPU/server.")
 
     parser.add_argument("--fallback-recognizer", type=str, default="none",
                         choices=["none", "trocr-small", "ppocrv5", "parseq", "master", "crnn_mobilenet_v3_small", "crnn_vgg16_bn", "crnn_mobilenet_v3_large", "vitstr_small"],
