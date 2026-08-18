@@ -8,7 +8,7 @@ import torch
 from doctr.models import recognition_predictor
 
 from .base import TextRecognitionStrategy
-from parallel_utils import run_batches_adaptive
+from parallel_utils import run_batches_pipelined
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ class DocTR_FastRecognizer(TextRecognitionStrategy):
         if self.device.type == "cuda":
             self.model = self.model.to(self.device)
             if hasattr(self.model, "model"):
-                self.model.model = torch.compile(self.model.model)
+                self.model.model = torch.compile(self.model.model, dynamic=True)
 
         self.batch_size = batch_size
         self.use_fp16 = use_fp16 and self.device.type == "cuda"
@@ -47,41 +47,41 @@ class DocTR_FastRecognizer(TextRecognitionStrategy):
 
         self.last_infer_time = 0.0
 
-        valid_np_crops, crop_mapping = [], []
+        valid_crops = []
         for crop_data in image_crops:
             crop_tensor = crop_data["crop_tensor"]
             if crop_tensor.numel() == 0 or crop_tensor.shape[-1] == 0 or crop_tensor.shape[-2] == 0:
                 continue
-            img_np = crop_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            img_np = (img_np * 255).astype(np.uint8)
-            
-            h, w = img_np.shape[:2]
-            if min(h, w) < self._MIN_CROP_DIM:
-                factor = self._MIN_CROP_DIM / max(1, min(h, w))
-                img_np = cv2.resize(img_np, (max(1, int(w * factor)), max(1, int(h * factor))), interpolation=cv2.INTER_LANCZOS4)
-            
-            valid_np_crops.append(img_np)
-            crop_mapping.append(crop_data)
+            valid_crops.append(crop_data)
 
-        if not valid_np_crops:
+        if not valid_crops:
             return []
 
-        order = sorted(range(len(valid_np_crops)), key=lambda i: valid_np_crops[i].shape[1] / max(1, valid_np_crops[i].shape[0]))
-        valid_np_crops = [valid_np_crops[i] for i in order]
-        crop_mapping = [crop_mapping[i] for i in order]
+        valid_crops.sort(key=lambda c: c["crop_tensor"].shape[-1] / max(1, c["crop_tensor"].shape[-2]))
 
-        logger.info(f"Recognizing {len(valid_np_crops)} words using docTR fast recognizer "
+        logger.info(f"Recognizing {len(valid_crops)} words using docTR fast recognizer "
                     f"(batch={self.batch_size if self.batch_size else 'auto'})...")
 
-        def _forward(batch):
-            batch_np = [b[0] for b in batch]
-            batch_mapping = [b[1] for b in batch]
+        def _prepare(batch_crops):
+            batch_np = []
+            for c in batch_crops:
+                img_np = c["crop_tensor"].squeeze(0).permute(1, 2, 0).cpu().numpy()
+                img_np = (img_np * 255).astype(np.uint8)
 
+                h, w = img_np.shape[:2]
+                if min(h, w) < self._MIN_CROP_DIM:
+                    factor = self._MIN_CROP_DIM / max(1, min(h, w))
+                    img_np = cv2.resize(img_np, (max(1, int(w * factor)), max(1, int(h * factor))), interpolation=cv2.INTER_LANCZOS4)
+
+                batch_np.append(img_np)
+            return batch_np
+
+        def _compute(batch_crops, batch_np):
             with self._autocast():
                 results = self.model(batch_np)
 
             batch_output = []
-            for crop_data, result in zip(batch_mapping, results):
+            for crop_data, result in zip(batch_crops, results):
                 text_str, confidence = result
                 text_str = self._CLEAN_PATTERN.sub('', text_str).strip()
                 if not text_str:
@@ -95,9 +95,8 @@ class DocTR_FastRecognizer(TextRecognitionStrategy):
                 })
             return batch_output
 
-        combined = list(zip(valid_np_crops, crop_mapping))
-        recognized_output, self.last_infer_time = run_batches_adaptive(
-            combined, _forward,
+        recognized_output, self.last_infer_time = run_batches_pipelined(
+            valid_crops, _prepare, _compute,
             model_key=f"doctr_fast:{self.model_info}", device=self.device,
             batch_size=self.batch_size, start_batch=8, max_batch=256,
         )

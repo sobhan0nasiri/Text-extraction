@@ -64,7 +64,7 @@ def _partition_into_columns(boxes, column_gap_threshold=35):
 
 def smart_merge_boxes(
     boxes,
-    enable_merging=False,
+    enable_merging=True,
     min_area=32,
     y_tolerance_ratio=0.40,
     x_gap_multiplier=2.0,
@@ -518,6 +518,10 @@ class OCRPipeline:
             logger.info(f"  - Detection Ensemble Merge  [algorithm]: {t_detection_merge:.2f}s")
         logger.info(f"  - Box Merging               [smart_merge_boxes algorithm]: {t_box_merge:.2f}s")
         logger.info(f"  - Text Recognition          [{self._model_info(self.text_recognizer)}]: {t_recognition:.2f}s ({len(final_text_results)} words)")
+        server_compute = getattr(self.text_recognizer, "last_server_compute_time", None)
+        if server_compute is not None:
+            overhead = getattr(self.text_recognizer, "last_overhead_time", max(0.0, t_recognition - server_compute))
+            logger.info(f"      -> server compute: {server_compute:.2f}s | network+encode overhead: {overhead:.2f}s")
         if self.fallback_recognizer is not None:
             logger.info(f"  - Fallback Recognition      [{self._model_info(self.fallback_recognizer)}]: {t_fallback:.2f}s ({fallback_word_count} words)")
         logger.info("-" * 60)
@@ -555,6 +559,9 @@ class OCRPipeline:
         optimized_np = cv2.cvtColor(gray_sharp, cv2.COLOR_GRAY2RGB)
 
         optimized_tensor = torch.from_numpy(optimized_np / 255.0).permute(2, 0, 1).unsqueeze(0).float()
+        if image.device.type == "cuda":
+            optimized_tensor = optimized_tensor.pin_memory()
+            return optimized_tensor.to(image.device, non_blocking=True)
         return optimized_tensor.to(image.device)
 
     @staticmethod
@@ -625,4 +632,3 @@ class OCRPipeline:
                     line_idx += 1
 
         return final_lines
-    

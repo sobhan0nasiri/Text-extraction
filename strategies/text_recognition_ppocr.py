@@ -38,6 +38,8 @@ class PPOCRv5_Recognizer(TextRecognitionStrategy):
         self.timeout = timeout
         self.last_infer_time = 0.0
         self.last_server_compute_time = 0.0
+        self.last_overhead_time = 0.0
+        self.last_wall_time = 0.0
 
         self.model_info = "PP-OCRv5 (remote microservice)"
         self.base_urls, self.replica_counts = self._check_servers([u.rstrip("/") for u in raw_urls])
@@ -90,13 +92,14 @@ class PPOCRv5_Recognizer(TextRecognitionStrategy):
             factor = PPOCRv5_Recognizer._MIN_CROP_DIM / max(1, min(h, w))
             img_np = cv2.resize(img_np, (max(1, int(w * factor)), max(1, int(h * factor))), interpolation=cv2.INTER_LANCZOS4)
         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-        ok, buf = cv2.imencode(".png", img_bgr)
+        ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
         return buf.tobytes() if ok else None
 
     def _post_once(self, batch_url, crops, server_batch_hint):
-        encoded = [self._encode_crop(c["crop_tensor"]) for c in crops]
+        encode_futures = [self.executor.submit(self._encode_crop, c["crop_tensor"]) for c in crops]
+        encoded = [f.result() for f in encode_futures]
         files = [
-            ("images", (f"crop_{i}.png", data, "image/png"))
+            ("images", (f"crop_{i}.jpg", data, "image/jpeg"))
             for i, data in enumerate(encoded) if data is not None
         ]
         sent_crops = [c for c, data in zip(crops, encoded) if data is not None]
@@ -134,6 +137,8 @@ class PPOCRv5_Recognizer(TextRecognitionStrategy):
         if not valid_crops:
             self.last_infer_time = 0.0
             self.last_server_compute_time = 0.0
+            self.last_overhead_time = 0.0
+            self.last_wall_time = 0.0
             return []
 
         t_wall0 = time.perf_counter()
@@ -195,8 +200,12 @@ class PPOCRv5_Recognizer(TextRecognitionStrategy):
                     "conf": float(res.get("conf", 0.0))
                 })
 
-        self.last_infer_time = time.perf_counter() - t_wall0
+        wall_time = time.perf_counter() - t_wall0
         self.last_server_compute_time = server_compute_max
+        self.last_overhead_time = max(0.0, wall_time - server_compute_max)
+        self.last_wall_time = wall_time
+
+        self.last_infer_time = server_compute_max
 
         recognized_output.sort(key=lambda r: r["word_id"])
         return recognized_output

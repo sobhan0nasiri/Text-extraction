@@ -74,6 +74,8 @@ class DocTR_RealWeightsDetector(TextDetectionStrategy):
 
     @torch.inference_mode()
     def detect_text_boxes(self, image: torch.Tensor) -> list:
+        t0 = time.perf_counter()
+
         h, w = image.shape[-2], image.shape[-1]
 
         img_np = get_frame_rgb_uint8(image)
@@ -89,10 +91,8 @@ class DocTR_RealWeightsDetector(TextDetectionStrategy):
         else:
             infer_img = img_np
 
-        t0 = time.perf_counter()
         with self._autocast():
             out = self.model([infer_img])
-        self.last_infer_time = time.perf_counter() - t0
 
         detected_boxes, word_id = [], 1
         for xmin_norm, ymin_norm, xmax_norm, ymax_norm, conf in out[0]['words']:
@@ -107,6 +107,7 @@ class DocTR_RealWeightsDetector(TextDetectionStrategy):
             detected_boxes.append({"word_id": word_id, "box": [x1, y1, x2, y2], "score": float(conf)})
             word_id += 1
 
+        self.last_infer_time = time.perf_counter() - t0
         return detected_boxes
 
 

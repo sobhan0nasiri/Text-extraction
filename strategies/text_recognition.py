@@ -78,7 +78,7 @@ class TrOCR_RealWeightsRecognizer(TextRecognitionStrategy):
         self.model.to(self.device)
         self.model.eval()
         if self.device.type == "cuda":
-            self.model = torch.compile(self.model)
+            self.model = torch.compile(self.model, dynamic=True)
 
         self.use_fp16 = use_fp16 and self.device.type == "cuda"
         self.model_info = f"TrOCR ({model_name}, beams={num_beams})"

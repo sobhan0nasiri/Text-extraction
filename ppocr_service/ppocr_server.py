@@ -76,6 +76,8 @@ def health():
 
 @app.route("/recognize_batch", methods=["POST"])
 def recognize_batch():
+    t_req0 = time.perf_counter()
+
     files = request.files.getlist("images")
     if not files:
         return jsonify({"error": "no images provided under 'images' field"}), 400
@@ -133,7 +135,9 @@ def recognize_batch():
 
         model_time = max(replica_times) if replica_times else 0.0
 
-    return jsonify({"results": results, "model_time": model_time})
+    decode_time = max(0.0, (time.perf_counter() - t_req0) - model_time)
+
+    return jsonify({"results": results, "model_time": model_time, "decode_time": decode_time})
 
 
 if __name__ == "__main__":

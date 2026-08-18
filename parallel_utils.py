@@ -275,8 +275,11 @@ def run_batches_pipelined(items: list, prepare_fn, compute_fn, model_key: str, d
     sizer = None if batch_size else AdaptiveBatchSizer.get(model_key, device, start_batch=start_batch, max_batch=max_batch)
     executor = get_shared_executor()
     n = len(items)
+    pending = {}
 
     def _submit_prepare(start):
+        if start in pending:
+            return pending.pop(start)
         remaining = n - start
         size = batch_size if batch_size else sizer.suggest(remaining)
         size = max(min_batch, min(size, remaining))
@@ -296,9 +299,9 @@ def run_batches_pipelined(items: list, prepare_fn, compute_fn, model_key: str, d
 
         next_start = end
         if next_start < n:
-            prefetch_future, prefetch_range = _submit_prepare(next_start)
+            next_future, next_range = _submit_prepare(next_start)
         else:
-            prefetch_future, prefetch_range = None, None
+            next_future, next_range = None, None
 
         try:
             t0 = time.perf_counter()
@@ -317,8 +320,12 @@ def run_batches_pipelined(items: list, prepare_fn, compute_fn, model_key: str, d
                 logger.warning(f"OOM at fixed batch_size={chunk_len} for {model_key}@{device}; retrying at {batch_size}.")
             else:
                 raise
+            if next_future is not None:
+                pending[next_range[0]] = (next_future, next_range)
             prefetch_future, prefetch_range = _submit_prepare(start)
             continue
+
+        prefetch_future, prefetch_range = next_future, next_range
 
         results.extend(out)
         total_elapsed += elapsed

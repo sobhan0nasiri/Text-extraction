@@ -23,6 +23,13 @@ class DocAligner_RealWeightsDetector(CornerDetectionStrategy):
 
     @torch.inference_mode()
     def detect_corners(self, image: torch.Tensor, coarse_bbox=None) -> tuple:
+        t0 = time.perf_counter()
+        try:
+            return self._detect_corners_impl(image, coarse_bbox)
+        finally:
+            self.last_infer_time = time.perf_counter() - t0
+
+    def _detect_corners_impl(self, image: torch.Tensor, coarse_bbox=None) -> tuple:
         img_np_full = get_frame_rgb_uint8(image)
         img_bgr_full = cv2.cvtColor(img_np_full, cv2.COLOR_RGB2BGR)
 
@@ -57,9 +64,7 @@ class DocAligner_RealWeightsDetector(CornerDetectionStrategy):
             cv2.imwrite("debug_corner_model_input.jpg", img_bgr)
             logger.debug("Saved exact image fed to DocAligner -> debug_corner_model_input.jpg")
 
-        t0 = time.perf_counter()
         polygon = self.model(img_bgr)
-        self.last_infer_time = time.perf_counter() - t0
 
         source = "docaligner"
         if polygon is None or len(polygon) != 4:

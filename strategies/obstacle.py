@@ -65,6 +65,8 @@ class RTDETR_RealWeightsDetector(ObstacleDetectionStrategy):
 
     @torch.inference_mode()
     def analyze(self, image: torch.Tensor) -> FrameDetections:
+        t0 = time.perf_counter()
+
         img_np_full = get_frame_rgb_uint8(image)
         orig_h, orig_w = img_np_full.shape[:2]
 
@@ -80,15 +82,15 @@ class RTDETR_RealWeightsDetector(ObstacleDetectionStrategy):
         target_sizes = torch.tensor([img_np.shape[:2]]).to(self.device)
         inputs = self.processor(images=img_np, return_tensors="pt").to(self.device)
 
-        t0 = time.perf_counter()
         with self._autocast():
             outputs = self.model(**inputs)
-        self.last_infer_time = time.perf_counter() - t0
 
         low_threshold = min(self.screen_threshold, self.obstacle_threshold)
         results = self.processor.post_process_object_detection(
             outputs, target_sizes=target_sizes, threshold=low_threshold
         )[0]
+
+        self.last_infer_time = time.perf_counter() - t0
 
         detections = FrameDetections()
         logger.debug("RT-DETR single-pass output:")
