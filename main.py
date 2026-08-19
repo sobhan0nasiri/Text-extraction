@@ -35,6 +35,43 @@ from strategies.text_detection import (
 )
 
 
+def _to_inference_device(image_tensor, device):
+    if device != "cuda":
+        return image_tensor
+    return image_tensor.pin_memory().to(device, non_blocking=True)
+
+
+def _warmup_models(obstacle_detector, corner_detector, text_detector,
+                    text_recognizer, fallback_recognizer, device, logger):
+
+    t0 = time.time()
+    dummy_frame = torch.rand(1, 3, 1080, 1920)
+    dummy_frame = _to_inference_device(dummy_frame, device)
+
+    def _try(label, fn):
+        try:
+            fn()
+        except Exception as e:
+            logger.debug(f"Warm-up step '{label}' skipped ({e.__class__.__name__}: {e}).")
+
+    _try("obstacle_detector", lambda: obstacle_detector.analyze(dummy_frame))
+    _try("corner_detector", lambda: corner_detector.detect_corners(dummy_frame, coarse_bbox=None))
+    _try("text_detector", lambda: text_detector.detect_text_boxes(dummy_frame))
+
+    dummy_crops = []
+    for i, w in enumerate((48, 96, 160, 256), start=1):
+        crop = torch.rand(1, 3, 32, w)
+        dummy_crops.append({"word_id": i, "box": [0, 0, w, 32], "crop_tensor": _to_inference_device(crop, device)})
+
+    for recognizer in (text_recognizer, fallback_recognizer):
+        if recognizer is None:
+            continue
+        _try(recognizer.__class__.__name__, lambda r=recognizer: r.recognize_text(dummy_crops))
+
+    logger.info(f"Model warm-up finished in {time.time() - t0:.2f}s "
+                f"(this cost is now paid once here instead of inside your real scan).")
+
+
 def _decode_image_worker(path):
     img_bgr = cv2.imread(path)
     if img_bgr is None:
@@ -274,6 +311,10 @@ def main():
     crop_pad_ratio=0.55
 )
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    _warmup_models(obstacle_detector, corner_detector, text_detector,
+                    text_recognizer, fallback_recognizer, device, logger)
+
     if args.mode == "file":
         if not args.file:
             logger.error("--file argument is required when mode='file'")
@@ -283,6 +324,7 @@ def main():
             image_tensor = file_input.get_frame()
 
             if image_tensor is not None:
+                image_tensor = _to_inference_device(image_tensor, device)
 
                 results = pipeline.process_image(image_tensor)
 
@@ -323,6 +365,7 @@ def main():
                     continue
 
                 image_tensor = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+                image_tensor = _to_inference_device(image_tensor, device)
 
                 try:
                     results = pipeline.process_image(image_tensor)
@@ -381,7 +424,7 @@ def main():
                 elif key == ord('s'):
                     logger.info("'s' pressed! Processing the captured frame...")
                     try:
-                        results = pipeline.process_image(frame_tensor)
+                        results = pipeline.process_image(_to_inference_device(frame_tensor, device))
                         if results:
                             print("\n[RESULT] Extracted Texts (Line by Line):")
                             for r in results:

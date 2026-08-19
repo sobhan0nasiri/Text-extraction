@@ -1,4 +1,5 @@
 import re
+import struct
 import time
 import logging
 
@@ -13,6 +14,8 @@ from parallel_utils import get_shared_executor, split_into_chunks, AdaptiveBatch
 
 logger = logging.getLogger(__name__)
 
+_RAW_HEADER = struct.Struct(">3I")
+
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
@@ -23,7 +26,7 @@ class PPOCRv5_Recognizer(TextRecognitionStrategy):
     _CLEAN_PATTERN = re.compile(r'[^A-Za-z0-9\s\.\,\:\;\!\?\-\>\<\_\(\)\[\]\'\"\/\\@#\$%&\*\+=\~\^\u2022\u2605\u25CF\u25AA\u2023\u2666]')
     _MIN_CROP_DIM = 32
 
-    _MAX_CROPS_PER_REQUEST = 512
+    _AUTO_CHUNK_REFERENCE = 256
 
     def __init__(self, server_url=None, server_urls=None,
                     batch_size: int = 32, timeout: float = 30.0, max_workers: int = None):
@@ -86,20 +89,25 @@ class PPOCRv5_Recognizer(TextRecognitionStrategy):
 
     @staticmethod
     def _encode_crop(crop_tensor: torch.Tensor):
-        img_np = (crop_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        h, w = img_np.shape[:2]
-        if min(h, w) < PPOCRv5_Recognizer._MIN_CROP_DIM:
-            factor = PPOCRv5_Recognizer._MIN_CROP_DIM / max(1, min(h, w))
-            img_np = cv2.resize(img_np, (max(1, int(w * factor)), max(1, int(h * factor))), interpolation=cv2.INTER_LANCZOS4)
-        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-        ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-        return buf.tobytes() if ok else None
+        try:
+            img_np = (crop_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            h, w = img_np.shape[:2]
+            if min(h, w) < PPOCRv5_Recognizer._MIN_CROP_DIM:
+                factor = PPOCRv5_Recognizer._MIN_CROP_DIM / max(1, min(h, w))
+                img_np = cv2.resize(img_np, (max(1, int(w * factor)), max(1, int(h * factor))), interpolation=cv2.INTER_LANCZOS4)
+
+            img_bgr = np.ascontiguousarray(img_np[:, :, ::-1])
+            header = _RAW_HEADER.pack(img_bgr.shape[0], img_bgr.shape[1], img_bgr.shape[2])
+            return header + img_bgr.tobytes()
+        except Exception as e:
+            logger.warning(f"Failed to encode a crop for PP-OCRv5: {e}")
+            return None
 
     def _post_once(self, batch_url, crops, server_batch_hint):
         encode_futures = [self.executor.submit(self._encode_crop, c["crop_tensor"]) for c in crops]
         encoded = [f.result() for f in encode_futures]
         files = [
-            ("images", (f"crop_{i}.jpg", data, "image/jpeg"))
+            ("images", (f"crop_{i}.raw", data, "application/octet-stream"))
             for i, data in enumerate(encoded) if data is not None
         ]
         sent_crops = [c for c, data in zip(crops, encoded) if data is not None]
@@ -127,6 +135,14 @@ class PPOCRv5_Recognizer(TextRecognitionStrategy):
                 logger.warning(f"PP-OCRv5 retry to {batch_url} also failed ({len(crops)} crops skipped): {e2}")
                 return [], {"results": [], "model_time": 0.0}, 0.0
 
+    def _plan_request_count(self, n_items: int, replicas: int) -> int:
+        if n_items <= 0:
+            return 0
+        reference = self.batch_size if self.batch_size else self._AUTO_CHUNK_REFERENCE
+
+        by_batch = _ceil_div(n_items, reference)
+        return max(1, min(n_items, max(replicas, by_batch)))
+
     @torch.inference_mode()
     def recognize_text(self, image_crops: list) -> list:
         valid_crops = [c for c in image_crops
@@ -153,8 +169,7 @@ class PPOCRv5_Recognizer(TextRecognitionStrategy):
             if not group:
                 continue
             replicas = self.replica_counts[port_idx]
-            n_requests = max(1, min(replicas, len(group)))
-            n_requests = max(n_requests, _ceil_div(len(group), self._MAX_CROPS_PER_REQUEST))
+            n_requests = self._plan_request_count(len(group), replicas)
             sub_groups = split_into_chunks(group, n_requests) if n_requests > 1 else [group]
 
             base_url = self.base_urls[port_idx]
